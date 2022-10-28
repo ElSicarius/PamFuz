@@ -1,4 +1,5 @@
 import asyncio
+from asyncio.base_futures import _FINISHED
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from html import escape
@@ -8,23 +9,96 @@ from urllib.parse import quote_plus, urlparse, urlunparse
 import uuid
 from pyppeteer import launch, connect
 from loguru import logger
+from pyppeteer.page import Page
+from pyppeteer.browser import Browser
+from pyppeteer.network_manager import Request as pyppeteer_Request
 import requests
 import re
+import time
 import argparse
 import difflib
 import urllib3
+import warnings
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 urllib3.disable_warnings()
 
 
-PARAM_TEMPLATE_FORMENCODED = ("", "%k=%v", "&", "")
-PARAM_TEMPLATE_JSON = ("{", '"%k":"%v"', ",", "}")
+PARAM_TEMPLATE_FORMENCODED = ("", "%k=%v", "&", ""), {
+    "Content-Type": "application/x-www-form-urlencoded"
+}
+PARAM_TEMPLATE_JSON = ("{", '"%k":"%v"', ",", "}"), {"Content-Type": "application/json"}
 PARAM_TEMPLATE_XML = (
     '<?xml version="1.0" encoding="UTF-8"?><root>\n',
     " <%k>%v</%k>",
     "\n",
     "\n</root>",
+), {"Content-Type": "application/xml"}
+PARAM_TEMPLATE_WEBKIT = (
+    (
+        "------WebKitFormBoundaryptDuvVQHzBBfQmRx\n",
+        """Content-Disposition: form-data; name="%k"
+
+%v""",
+        "\n------WebKitFormBoundaryptDuvVQHzBBfQmRx\n",
+        "\n------WebKitFormBoundaryptDuvVQHzBBfQmRx--",
+    ),
+    {
+        "Content-Type": "multipart/form-data; boundary=----WebKitFormBoundaryptDuvVQHzBBfQmRx",
+    },
 )
+PARAM_TEMPLATE_WEBKIT2 = (
+    (
+        "------WebKitFormBoundaryptDuvVQHzBBfQmRx\n",
+        """Content-Disposition: form-data; name="%k"; filename="%k.png"
+Content-Type: image/png
+
+%v""",
+        "\n------WebKitFormBoundaryptDuvVQHzBBfQmRx\n",
+        "\n------WebKitFormBoundaryptDuvVQHzBBfQmRx--",
+    ),
+    {
+        "Content-Type": "multipart/form-data; boundary=----WebKitFormBoundaryptDuvVQHzBBfQmRx",
+    },
+)
+
+
+class Alternative_Response:
+    """Copy the structure of requests.Response"""
+
+    class Elapsed:
+        seconds: float
+
+        def __init__(self, seconds):
+            self.seconds = seconds
+
+        def total_seconds(self):
+            return self.seconds
+
+    @dataclass
+    class Alternative_Request:
+        url: str
+        data: str
+        method: str
+
+    text: str
+    status_code: int
+    elapsed: Elapsed
+    request: Alternative_Request
+
+    def __init__(
+        self,
+        url: str,
+        data: str,
+        method: str,
+        response_text: str,
+        status: int,
+        seconds: float,
+    ):
+        self.elapsed = self.Elapsed(seconds)
+        self.request = self.Alternative_Request(url, data, method)
+        self.text = response_text
+        self.status_code = status
 
 
 class Handlers:
@@ -34,7 +108,8 @@ class Handlers:
     def request_handler(self, request):
         # if request.url.endswith('.png') or request.url.endswith('.jpg'):
         #     await request.abort()
-        asyncio.create_task(request.continue_())
+        # asyncio.create_task(request.continue_())
+        pass
 
     def console_handler(self, event):
         if event.type == "error":
@@ -48,18 +123,23 @@ class BaseRequest:
 
 
 class Comparer:
-    base_request: requests.Response
+    base_request: requests.Response | Alternative_Response
 
     def __init__(self, base_request: BaseRequest):
         self.base_request = base_request.base_request
         self.base_reflexions = base_request.base_reflexions
 
-    def _compare_statuses(self, current_request: requests.Response):
-        return self.base_request.status_code == current_request.status_code, f"{self.base_request.status_code}:{current_request.status_code}"
+    def _compare_statuses(
+        self, current_request: requests.Response | Alternative_Response
+    ):
+        return (
+            self.base_request.status_code == current_request.status_code,
+            f"{self.base_request.status_code}:{current_request.status_code}",
+        )
 
     def _compare_texts(
         self,
-        current_request: requests.Response,
+        current_request: requests.Response | Alternative_Response,
         params_string: str,
         threshold: float = 0.98,
     ):
@@ -71,15 +151,24 @@ class Comparer:
         return False, diff
 
     def _compare_times(
-        self, current_request: requests.Response, tolerance: float = 1.3
+        self,
+        current_request: requests.Response | Alternative_Response,
+        tolerance: float = 1.3,
     ):
         high = current_request.elapsed.seconds + tolerance
         low = current_request.elapsed.seconds - tolerance
         if low < self.base_request.elapsed.seconds < high:
-            return True, f"l:{low} < base:{self.base_request.elapsed.seconds} < h:{high}"
+            return (
+                True,
+                f"l:{low} < base:{self.base_request.elapsed.seconds} < h:{high}",
+            )
         return False, f"l:{low} < base:{self.base_request.elapsed.seconds} < h:{high}"
 
-    def _compare_reflexions(self, current_request: requests.Response, raw_params: dict):
+    def _compare_reflexions(
+        self,
+        current_request: requests.Response | Alternative_Response,
+        raw_params: dict,
+    ):
         for p, v in raw_params.items():
             if current_request.text.count(v) != self.base_reflexions[1]:
                 return False, p
@@ -87,13 +176,15 @@ class Comparer:
 
     def is_equal(
         self,
-        current_request: requests.Response,
+        current_request: requests.Response | Alternative_Response,
         formatted_params_string: str,
         raw_params: dict,
     ) -> bool:
-        status_comparison,_ = self._compare_statuses(current_request)
-        times_comparison,_ = self._compare_times(current_request)
-        texts_comparison,_ = self._compare_texts(current_request, formatted_params_string)
+        status_comparison, _ = self._compare_statuses(current_request)
+        times_comparison, _ = self._compare_times(current_request)
+        texts_comparison, _ = self._compare_texts(
+            current_request, formatted_params_string
+        )
         reflexions_comparison, _ = self._compare_reflexions(current_request, raw_params)
 
         # print(status_comparison, times_comparison, texts_comparison, reflexions_comparison)
@@ -132,7 +223,10 @@ class Web_classic:
         self.browser = requests.Session()
 
     def page_goto(
-        self, url: str, data: str = "", method: str = "GET"
+        self,
+        url: str,
+        data: str = "",
+        method: str = "GET",
     ) -> None | requests.Response:
         try:
             self.page = getattr(self.browser, method.lower())(
@@ -162,7 +256,8 @@ class Web_classic:
 
 
 class Web_headless:
-    pages: dict
+    pages: list[Page]
+    browser: Browser = None
 
     def __init__(
         self,
@@ -201,68 +296,81 @@ class Web_headless:
                 browserURL=f"http://127.0.0.1:{self.attach_to_existing_chrome}"
             )
         else:
+            exit("No chrome detected")
             self.browser = await launch(self.pyppeteer_args)
 
-    async def new_page(self):
-        if self.open_new_tabs:
+    async def new_page(self, force=False):
+
+        if self.open_new_tabs or force:
             logger.debug("Spawning new page for link")
-            self.pages.append(await self.browser.newPage())
+            await self.browser.newPage()
+            self.pages = list(await self.browser.pages())
             id_ = len(self.pages) - 1
-            await self.pages[id_].setViewport({"defaultViewport": None})
+
+            # await self.pages[id_].setViewport({"defaultViewport": None})
             # set request handler to override headers when request
-            await self.pages[id_].setRequestInterception(True)
-            self.pages[id_].on("request", self.Handlers.request_handler)
-            self.pages[id_].on("console", self.Handlers.console_handler)
-
-            self.pages[id_].setDefaultNavigationTimeout(self.timeout * 1000)
-
         else:
-            pages = await self.browser.pages()
+            self.pages = list(await self.browser.pages())
 
-            if len(pages) == 0:
+            if len(self.pages) == 0:
                 logger.debug("There is no current page, Spawning new page for link")
                 self.pages.append(await self.browser.newPage())
-                await self.pages[id_].setViewport({"defaultViewport": None})
-                # set request handler to override headers when request
-                await self.pages[id_].setRequestInterception(True)
-                self.pages[id_].on("request", self.Handlers.request_handler)
-                self.pages[id_].on("console", self.Handlers.console_handler)
-                self.pages[id_].setDefaultNavigationTimeout(self.timeout * 1000)
-                self.results.setdefault(id_, dict())
-            else:
-                self.pages = pages[:1]
+            # await self.pages[0].close()
+            # self.pages[0] = await self.browser.newPage()
             id_ = 0
-        self.results.setdefault(id_, dict())
 
+        self.pages[id_].remove_all_listeners()
+        await self.pages[id_].setRequestInterception(True)
+        # self.pages[id_].on("console", self.Handlers.console_handler)
+
+        self.pages[id_].setDefaultNavigationTimeout(self.timeout * 1000)
+        # await self.pages[id_].setViewport({"defaultViewport": None})
+        self.results.setdefault(id_, dict())
         return id_
 
-    async def page_goto(self, id, url, headers={}):
-        try:
-            h = self.forced_headers.copy()
-            h.update(headers)
-            await self.pages[id].setExtraHTTPHeaders(h)
-            p = await self.pages[id].goto(url, waitUntil="networkidle0")
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            return False
-        self.results[id]["url"] = url
-        return p
+    async def req_handler(self, req: pyppeteer_Request, method, data):
+        await req.continue_(overrides={"method": method, "postData": data})
+
+    async def page_goto(self, url, data, method, force_new_tab: bool = False):
+        if not self.browser:
+            await self.start_browser()
+        id_ = await self.new_page(force_new_tab)
+        h = self.forced_headers.copy()
+        await self.pages[id_].setExtraHTTPHeaders(h)
+        if len(self.pages[id_].listeners("request")) > 0:
+            self.pages[id_].remove_listener(
+                "request", self.pages[id_].listeners("request")[0]
+            )
+        self.pages[id_].on(
+            "request",
+            lambda req: asyncio.ensure_future(self.req_handler(req, method, data)),
+        )
+        # p = await self.pages[id_].goto(url, waitUntil="networkidle2")
+        p = await self.pages[id_].goto(url, waitUntil="domcontentloaded")
+
+        time_spent = 1
+        body = await self.pages[id_].content()
+        status = p._status
+        if not id_ == 0:
+            await self.pages[id_].close()
+        self.results[id_]["url"] = url
+        return Alternative_Response(url, data, method, body, status, time_spent)
 
     async def get_page_content(self, id):
         try:
             body = await self.pages[id].content()
-            self.results[id]["body"] = body
+            self.results[0]["body"] = body
             return body
         except Exception as e:
             logger.error(f"Error: {e}")
-            self.results[id]["body"] = ""
+            self.results[0]["body"] = ""
             return ""
 
     async def close_browser(self):
         await self.browser.close()
 
     async def screenshot_page(self, id, path):
-        await self.pages[id].screenshot({"path": f"/tmp/{path}.png"})
+        await self.pages[0].screenshot({"path": f"/tmp/{path}.png"})
 
 
 class ParamFormat:
@@ -273,7 +381,7 @@ class ParamFormat:
     separator: str
 
     def __init__(self, format):
-        
+
         self.header = format[0]
         self.paramformat = format[1]
         self.separator = format[2]
@@ -286,7 +394,7 @@ class ParamFormat:
     def get_min_length(self):
         p = self.generate_string("", "", False)
         return len(self.header + p + self.footer)
-    
+
     def __str__(self):
         return f"{self.header}{self.generate_string('foo', 'bar')}{self.generate_string('foo2','bar2',False)}{self.footer}"
 
@@ -301,9 +409,10 @@ class Miner:
     wordlist: list
     max_uri_length: int = 8000  # 8kB d'URL par défaut
     base_request: Any
-    as_body: bool | None
+    not_as_body: bool | None
     threads_number: int
     found_params: dict
+    headless: bool
 
     def __init__(
         self,
@@ -314,19 +423,24 @@ class Miner:
         wordlist: str = "",
         threads_number: int = 3,
         params_format: str | None = None,
-        as_body: bool | None = False,
+        not_as_body: bool | None = False,
+        headless: bool = False,
     ) -> None:
         self.web = web
         self.url = url
         self.methods = methods
         self.wordlist_path = wordlist
         self.data = data
-        self.parameter_template = self.select_param_format(params_format)
-        self.as_body = as_body
+        self.parameter_template, special_headers = self.select_param_format(
+            params_format
+        )
+        self.web.forced_headers.update(special_headers)
+        self.not_as_body = not_as_body
         self.threads_number = threads_number
+        self.headless = headless
 
     @staticmethod
-    def as_body_selector(value: bool | None, method: str) -> bool:
+    def not_as_body_selector(value: bool | None, method: str) -> bool:
         match method:
             case "GET":
                 if value is None or not value:
@@ -335,8 +449,8 @@ class Miner:
                     return True
             case _:
                 if value:
-                    return True
-        return False
+                    return False
+        return True
 
     def select_param_format(self, params_format: str | None):
         match params_format:
@@ -346,8 +460,17 @@ class Miner:
                 return PARAM_TEMPLATE_JSON
             case "xml":
                 return PARAM_TEMPLATE_XML
+            case "webkit":
+                return PARAM_TEMPLATE_WEBKIT
+            case "webkit+":
+                return PARAM_TEMPLATE_WEBKIT2
             case _:
-                return params_format.split("§")
+                if not len(params_format.split("§")) == 4:
+                    logger.error(
+                        "Paramformat is wrong, check that you're using json/xml/webkit(+) or setting header§%k=%v§separator§footer"
+                    )
+                    exit(1)
+                return params_format.split("§"), {}
 
     @staticmethod
     def gen_random_value(size: int = 5):
@@ -411,12 +534,12 @@ class Miner:
         method: str,
         formatted_parameters: str,
         param_format: ParamFormat,
-        as_body: bool = True,
+        not_as_body: bool = True,
     ):
         url_parsed = urlparse(url)
         existing_params = url_parsed.query
         # print(formatted_parameters)
-        if not as_body:
+        if not not_as_body:
             new_params = self.merge_parameters(
                 param_format, existing_params, formatted_parameters
             )
@@ -434,7 +557,7 @@ class Miner:
             self.gen_random_value(6): self.gen_random_value(6)
             for _ in range(int(self.max_uri_length / 8))
         }
-        current_request: Any | requests.Response
+        current_request: Any | requests.Response | Alternative_Response
         current_request = None
         size = self.max_uri_length - (
             len(self.url) if method.upper() == "GET" else len(self.data)
@@ -461,11 +584,54 @@ class Miner:
                 method,
                 pack,
                 paramformat,
-                as_body=self.as_body_selector(self.as_body, method),
+                not_as_body=self.not_as_body_selector(self.not_as_body, method),
             )
             current_request = self.web.page_goto(sending_url, sending_data, method)
-            
-        return size - 1000
+
+        # remove a big chuck to be sure to
+        return size - 1000 if size > 2000 else size - 100
+
+    async def find_max_length_async(self, method: str, paramformat: ParamFormat):
+
+        param_list = {
+            self.gen_random_value(6): self.gen_random_value(6)
+            for _ in range(int(self.max_uri_length / 8))
+        }
+        current_request: Any | requests.Response | Alternative_Response
+        current_request = None
+        size = self.max_uri_length - (
+            len(self.url) if method.upper() == "GET" else len(self.data)
+        )
+        while (
+            current_request == None
+            or re.findall("41(3|4) ERROR", current_request.text, re.IGNORECASE)
+            or any(
+                [
+                    current_request.status_code == 414,
+                    current_request.status_code == 413,
+                    current_request.status_code
+                    != self.base_request.base_request.status_code,
+                ]
+            )
+        ):
+            # reduce size length for each row, give extra space for base row
+            size -= 300
+            logger.debug(f"Current pack size: {size}")
+            pack = self.gen_format_params(param_list, size, paramformat, 1)[0][0]
+            sending_url, sending_data, method = self.format_request(
+                self.url,
+                self.data,
+                method,
+                pack,
+                paramformat,
+                not_as_body=self.not_as_body_selector(self.not_as_body, method),
+            )
+            current_request = await self.web.page_goto(
+                sending_url, sending_data, method
+            )
+
+        # remove a big chuck to be sure to
+        return size - 1000 if size > 1500 else size - 300
 
     def threading(
         self,
@@ -475,7 +641,7 @@ class Miner:
         paramFormat: ParamFormat,
         fuzzing_params: str,
         raw_pack: dict,
-        original: bool
+        original: bool,
     ):
         sending_url, sending_data, method = self.format_request(
             url,
@@ -483,19 +649,44 @@ class Miner:
             method,
             fuzzing_params,
             paramFormat,
-            as_body=self.as_body_selector(self.as_body, method),
+            not_as_body=self.not_as_body_selector(self.not_as_body, method),
         )
         return (
             fuzzing_params,
             raw_pack,
             self.web.page_goto(sending_url, sending_data, method),
-            original
+            original,
+        )
+
+    async def threading_async(
+        self,
+        url: str,
+        data: str,
+        method: str,
+        paramFormat: ParamFormat,
+        fuzzing_params: str,
+        raw_pack: dict,
+        original: bool,
+    ):
+        sending_url, sending_data, method = self.format_request(
+            url,
+            data,
+            method,
+            fuzzing_params,
+            paramFormat,
+            not_as_body=self.not_as_body_selector(self.not_as_body, method),
+        )
+        return (
+            fuzzing_params,
+            raw_pack,
+            await self.web.page_goto(sending_url, sending_data, method, not original),
+            original,
         )
 
     def find_baseinfo(
         self, method: str, paramFormat: ParamFormat
     ) -> tuple[Any, tuple[int, int]]:
-        base_request = self.web.page_goto(self.url, self.data, method)
+
         param_name = self.gen_random_value(6)
         param_value = self.gen_random_value(6)
         formatted_param = self.gen_format_params(
@@ -507,35 +698,75 @@ class Miner:
             method,
             formatted_param,
             paramFormat,
-            as_body=self.as_body_selector(self.as_body, method),
+            not_as_body=self.not_as_body_selector(self.not_as_body, method),
         )
         request_reflects = self.web.page_goto(sending_url, sending_data, method)
         reflexions_value = request_reflects.text.count(param_value)
         reflexions_name = request_reflects.text.count(param_name)
 
         return (request_reflects, (reflexions_name, reflexions_value))
-    
-    def start_heuristics_checks(self, method: str, base_request: requests.Response) -> set:
+
+    async def find_baseinfo_async(
+        self, method: str, paramFormat: ParamFormat
+    ) -> tuple[Any, tuple[int, int]]:
+
+        param_name = self.gen_random_value(6)
+        param_value = self.gen_random_value(6)
+        formatted_param = self.gen_format_params(
+            {param_name: param_value}, 10000, paramFormat
+        )[0][0]
+        sending_url, sending_data, method = self.format_request(
+            self.url,
+            self.data,
+            method,
+            formatted_param,
+            paramFormat,
+            not_as_body=self.not_as_body_selector(self.not_as_body, method),
+        )
+        request_reflects = await self.web.page_goto(sending_url, sending_data, method)
+        reflexions_value = request_reflects.text.count(param_value)
+        reflexions_name = request_reflects.text.count(param_name)
+
+        return (request_reflects, (reflexions_name, reflexions_value))
+
+    def start_heuristics_checks(
+        self, method: str, base_request: requests.Response | Alternative_Response
+    ) -> set:
         parameters = set()
-        html_general_inputs = re.findall(r'<input.+?name=["\']?([^>"\'\s]+)', base_request.text, flags=re.IGNORECASE | re.DOTALL)
+        html_general_inputs = re.findall(
+            r'<input.+?name=["\']?([^>"\'\s]+)',
+            base_request.text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for generic_input in html_general_inputs:
+            if isText(generic_input):
+                parameters.add(generic_input)
         # forms = re.findall(r"<form.+?[^>]>(.+?)<\/form", base_request.text, flags=re.IGNORECASE | re.DOTALL)
-        scripts = re.findall(r"<script.+?[^>]>(.+?)<\/script", base_request.text, flags=re.IGNORECASE | re.DOTALL)
+        scripts = re.findall(
+            r"<script.+?[^>]>(.+?)<\/script",
+            base_request.text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         for script in scripts:
-            #checking empty vars in javascript
-            #this often results in free xss in the wild
+            # checking empty vars in javascript
+            # this often results in free xss in the wild
 
             # find params first way
-            for param in re.findall(r'([^\s!=<>]+)\s*=\s*[\'"`][\'"`]', base_request.text, re.IGNORECASE):
+            for param in re.findall(
+                r'([^\s!=<>]+)\s*=\s*[\'"`][\'"`]', base_request.text, re.IGNORECASE
+            ):
                 # check if its garbage
                 if isText(param):
                     parameters.add(param)
             # find params second way
-            for param in re.findall(r'([^\'"]+)[\'"]:\s?[\'"]', base_request.text, re.IGNORECASE):
+            for param in re.findall(
+                r'([^\'"]+)[\'"]:\s?[\'"]', base_request.text, re.IGNORECASE
+            ):
                 if isText(param):
                     parameters.add(param)
+        logger.success("Processing completed !")
         logger.warning(f"Potential parameters found (heuristics): {parameters}")
         return parameters
-        
 
     def mine(self) -> dict:
         self.load_wordlist()
@@ -547,8 +778,11 @@ class Miner:
 
             self.base_request = BaseRequest(base_request, number_reflexions)
             max_length = self.find_max_length(method, paramFormat)
-            self.found_params[method].union(self.start_heuristics_checks(method, base_request))
-            logger.debug(f"Found max length of {max_length}")
+            logger.debug(f"Found URL/DATA max length of {max_length}")
+            logger.debug("Starting heuristics checks")
+            self.found_params[method].union(
+                self.start_heuristics_checks(method, base_request)
+            )
 
             comparer = Comparer(self.base_request)
 
@@ -557,6 +791,7 @@ class Miner:
 
             packs = {wd: self.gen_random_value(5) for wd in self.wordlist}
             formatted_packs = self.gen_format_params(packs, max_length, paramFormat)
+            logger.debug("Starting aggressive fuzzing")
             futures.update(
                 {
                     executor.submit(
@@ -567,7 +802,7 @@ class Miner:
                         paramFormat,
                         formatted_pack_,
                         pack_,
-                        True
+                        True,
                     )
                     for formatted_pack_, pack_ in formatted_packs
                 }
@@ -578,13 +813,21 @@ class Miner:
                 # for each future done
                 for future in done:
                     request_count += 1
-                    print(f"Processing request {request_count}, {len(futures)} remains", end="\r") 
+                    print(
+                        f"Processing request {request_count}, {len(futures)} remains",
+                        end="\r",
+                    )
                     fuzzing_params: str
                     origin_pack: dict
-                    current_request: requests.Response
+                    current_request: requests.Response | Alternative_Response
                     original_request: bool
 
-                    fuzzing_params, origin_pack, current_request, original_request = future.result()
+                    (
+                        fuzzing_params,
+                        origin_pack,
+                        current_request,
+                        original_request,
+                    ) = future.result()
                     if len(origin_pack) < 1:
                         continue
                     if not comparer.is_equal(
@@ -600,17 +843,19 @@ class Miner:
                             logger.warning(f"Differences: Reflects;{p}")
                             del origin_pack[p]
                             self.found_params[method].add(p)
-                        statuses, status_reason = comparer._compare_statuses(current_request)
-                        texts, text_reason = comparer._compare_texts(current_request, fuzzing_params)
+                        statuses, status_reason = comparer._compare_statuses(
+                            current_request
+                        )
+                        texts, text_reason = comparer._compare_texts(
+                            current_request, fuzzing_params
+                        )
                         times, time_reason = comparer._compare_times(current_request)
-                        
-                        if (
-                            not statuses
-                            or not texts
-                            or not times
-                        ):
+
+                        if not statuses or not texts or not times:
                             if original_request:
-                                logger.warning(f"Differences:{f' Statuses:{status_reason}' if not statuses else ''}{f' Texts:{text_reason}' if not texts else ''}{f' Times:{time_reason}' if not times else ''}")
+                                logger.warning(
+                                    f"Differences:{f' Statuses:{status_reason}' if not statuses else ''}{f' Texts:{text_reason}' if not texts else ''}{f' Times:{time_reason}' if not times else ''}"
+                                )
                             if len(origin_pack) == 1:
                                 self.found_params[method].add(
                                     list(origin_pack.keys())[0]
@@ -641,7 +886,7 @@ class Miner:
                                         paramFormat,
                                         formatted_pack_1,
                                         first_half_pack,
-                                        False
+                                        False,
                                     )
                                 }
                             )
@@ -655,38 +900,146 @@ class Miner:
                                         paramFormat,
                                         formatted_pack_2,
                                         second_half_pack,
-                                        False
+                                        False,
                                     )
                                 }
                             )
-
-            print(self.found_params)
+            logger.success("Fuzzing completed !")
+            print(f"{self.found_params}")
 
         return self.found_params
 
+    async def mine_headless(self) -> dict:
+        self.load_wordlist()
+        paramFormat = ParamFormat(self.parameter_template)
+        self.found_params = {}
+        for method in self.methods:
+            self.found_params[method] = set()
+            base_request, number_reflexions = await self.find_baseinfo_async(
+                method, paramFormat
+            )
 
-# async def visit_n_parse_headless(self, id_, url):
-#     p = await self.web.page_goto(id_, url)
-#     try:
-#         self.add_visited({url}, status=p.status, headers=p.headers)
+            self.base_request = BaseRequest(base_request, number_reflexions)
+            max_length = await self.find_max_length_async(method, paramFormat)
+            logger.debug(f"Found URL/DATA max length of {max_length}")
+            logger.debug("Starting heuristics checks")
+            self.found_params[method].union(
+                self.start_heuristics_checks(method, base_request)
+            )
 
-#     except:
-#         self.add_failed({url})
-#         logger.warning(f"STATUS: FAIL | LINK: {url}")
+            comparer = Comparer(self.base_request)
 
-#     self.queue.discard(url)
-#     content = await self.web.get_page_content(id_)
-#     if p:
-#         logger.success(f"STATUS: {p.status} | LENGTH: {len(content)} | LINK: {url}")
-#     self.results_pages[url]["len"] = len(content)
-#     with open(f"/tmp/crawlalllinks/{id_}.txt", "w") as f:
-#         f.write(content)
-#     with open(f"/tmp/crawlalllinks/{id_}_decoded.txt", "w") as f:
-#         f.write(unescape(unquote(content)))
-#     links = self.find_all_links_v3(id_)
-#     for link in set(links.splitlines()):
-#         retrieved_links.add(link)
-#     return set(links.splitlines())
+            futures = set()
+
+            packs = {wd: self.gen_random_value(5) for wd in self.wordlist}
+            formatted_packs = self.gen_format_params(packs, max_length, paramFormat)
+            logger.debug("Starting aggressive fuzzing")
+            futures.update({})
+
+            pool = set()
+            pack_processed = set()
+
+            def process_response(res):
+                fuzzing_params: str
+                origin_pack: dict
+                current_request: Alternative_Response
+                original_request: bool
+                print(
+                    f"Processing requests, {len([task for task in asyncio.all_tasks() if task._state != _FINISHED])} / {len(asyncio.all_tasks())}",
+                    end="\r",
+                )
+
+                fuzzing_params, origin_pack, current_request, original_request = res
+                if fuzzing_params in pack_processed:
+                    return None, None
+                pack_processed.add(fuzzing_params)
+
+                if len(origin_pack) < 1:
+                    return None, None
+                if not comparer.is_equal(current_request, fuzzing_params, origin_pack):
+                    # logger.success(f"Pack is different")
+                    while not comparer._compare_reflexions(
+                        current_request, origin_pack
+                    )[0]:
+                        p = comparer._compare_reflexions(current_request, origin_pack)[
+                            1
+                        ]
+                        logger.warning(f"Differences: Reflects;{p}")
+                        del origin_pack[p]
+                        self.found_params[method].add(p)
+                    if len(origin_pack) <= 1:
+                        return None, None
+                    statuses, status_reason = comparer._compare_statuses(
+                        current_request
+                    )
+                    texts, text_reason = comparer._compare_texts(
+                        current_request, fuzzing_params
+                    )
+                    times, time_reason = comparer._compare_times(current_request)
+
+                    if not statuses or not texts or not times:
+                        if original_request:
+                            logger.warning(
+                                f"Differences:{f' Statuses:{status_reason}' if not statuses else ''}{f' Texts:{text_reason}' if not texts else ''}{f' Times:{time_reason}' if not times else ''}"
+                            )
+
+                        if len(origin_pack) == 1:
+                            self.found_params[method].add(list(origin_pack.keys())[0])
+                            return None, None
+                        # splitting the pack
+                        first_half_pack = dict(
+                            list(origin_pack.items())[: len(origin_pack) // 2]
+                        )
+                        # keep the original payload & params
+                        second_half_pack = dict(
+                            list(origin_pack.items())[len(origin_pack) // 2 :]
+                        )
+                        # logger.debug("Submitting 2 new packs to process")
+                        formatted_pack_1 = self.gen_format_params(
+                            first_half_pack, max_length, paramFormat
+                        )[0][0]
+                        formatted_pack_2 = self.gen_format_params(
+                            second_half_pack, max_length, paramFormat
+                        )[0][0]
+                        t1 = (
+                            formatted_pack_1,
+                            first_half_pack,
+                        )
+
+                        t2 = (
+                            formatted_pack_2,
+                            second_half_pack,
+                        )
+                        return t1, t2
+                return None, None
+
+            while len(formatted_packs) > 0:
+                formatted_packs_ = formatted_packs
+                formatted_packs = []
+                for formatted_pack_, pack_ in formatted_packs_:
+                    current_task = asyncio.create_task(
+                        self.threading_async(
+                            self.url,
+                            self.data,
+                            method,
+                            paramFormat,
+                            formatted_pack_,
+                            pack_,
+                            True,
+                        )
+                    )
+                    pool.add(current_task)
+
+                    for res in await asyncio.gather(*pool):
+                        t1, t2 = process_response(res)
+                        if t1 and t2:
+                            formatted_packs += [t1, t2]
+
+
+            logger.success("Fuzzing completed !")
+            print(f"{self.found_params}")
+
+        return self.found_params
 
 
 ####################
@@ -755,8 +1108,8 @@ def get_arguments():
         type=str,
     )
     parser.add_argument(
-        "--as-body",
-        help="Send parameters as body (default: auto, only GET method is not as_body)",
+        "--not-as-body",
+        help="Send parameters as URL instead of body for POST like requests (default: auto, only GET method is not_not_as_body)",
         default=None,
         action="store_true",
     )
@@ -770,12 +1123,17 @@ def load_headers(headers_string: list[str]):
         headers[header_name] = value
     return headers
 
-def isText(garbage:str) -> bool:
+
+def isText(garbage: str) -> bool:
     specials = "_[]-~.âàäçéèêëîïôùûüœ"
     for a in garbage:
         # find if whole param is normal string with few specific caracters
         # TODO: find a way to keep this check but include special foreign caracters (like chineese for instance)
-        if not (a.lower() in string.ascii_lowercase or a in string.digits or a in list(specials)+list(quote_plus(specials))+list(escape(specials))):
+        if not (
+            a.lower() in string.ascii_lowercase
+            or a in string.digits
+            or a in list(specials) + list(quote_plus(specials)) + list(escape(specials))
+        ):
             return False
     return True
 
@@ -800,9 +1158,16 @@ if __name__ == "__main__":
         arguments.wordlist,
         arguments.threads,
         arguments.params_format,
-        arguments.as_body,
+        arguments.not_as_body,
+        arguments.chrome_headless,
     )
-    miner.mine()
+    if arguments.chrome_headless:
+        executor = ThreadPoolExecutor(1)
+        loop = asyncio.get_event_loop()
+        loop.set_default_executor(executor)
+        asyncio.get_event_loop().run_until_complete(miner.mine_headless())
+    else:
+        miner.mine()
 
 
 # veb = Web_headless(load_headers(args.header), timeout=args.timeout, open_new_tabs=args.new_tabs_only, attach_to_existing_chrome=args.chrome_remote_debug)
