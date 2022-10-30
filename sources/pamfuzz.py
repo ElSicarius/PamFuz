@@ -4,7 +4,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from html import escape
 import string
-from typing import Any
+from typing import Any, Tuple
 from urllib.parse import quote_plus, urlparse, urlunparse
 import uuid
 from pyppeteer import launch, connect
@@ -263,7 +263,7 @@ class Web_headless:
         self,
         forced_headers: dict = {},
         timeout: int = 30,
-        attach_to_existing_chrome: bool = False,
+        attach_to_existing_chrome: int = False,
         open_new_tabs: bool = False,
         pyppeteer_args: dict = {
             "headless": True,
@@ -297,7 +297,7 @@ class Web_headless:
             )
         else:
             exit("No chrome detected")
-            self.browser = await launch(self.pyppeteer_args)
+            # self.browser = await launch(self.pyppeteer_args)
 
     async def new_page(self, force=False):
 
@@ -431,10 +431,10 @@ class Miner:
         self.methods = methods
         self.wordlist_path = wordlist
         self.data = data
-        self.parameter_template, special_headers = self.select_param_format(
+        self.parameter_template, self.special_headers = self.select_param_format(
             params_format
         )
-        self.web.forced_headers.update(special_headers)
+        self.web.forced_headers.update(self.special_headers)
         self.not_as_body = not_as_body
         self.threads_number = threads_number
         self.headless = headless
@@ -452,9 +452,9 @@ class Miner:
                     return False
         return True
 
-    def select_param_format(self, params_format: str | None):
+    def select_param_format(self, params_format: str | None) -> Tuple[Tuple[str,str,str,str], dict]:
         match params_format:
-            case None | "formencoded":
+            case None | "" | "formencoded":
                 return PARAM_TEMPLATE_FORMENCODED
             case "json":
                 return PARAM_TEMPLATE_JSON
@@ -470,7 +470,7 @@ class Miner:
                         "Paramformat is wrong, check that you're using json/xml/webkit(+) or setting header§%k=%v§separator§footer"
                     )
                     exit(1)
-                return params_format.split("§"), {}
+                return tuple(params_format.split("§")), {}
 
     @staticmethod
     def gen_random_value(size: int = 5):
@@ -773,15 +773,18 @@ class Miner:
         paramFormat = ParamFormat(self.parameter_template)
         self.found_params = {}
         for method in self.methods:
-            self.found_params[method] = set()
+            self.found_params[method] = dict()
             base_request, number_reflexions = self.find_baseinfo(method, paramFormat)
 
             self.base_request = BaseRequest(base_request, number_reflexions)
             max_length = self.find_max_length(method, paramFormat)
             logger.debug(f"Found URL/DATA max length of {max_length}")
             logger.debug("Starting heuristics checks")
-            self.found_params[method].union(
-                self.start_heuristics_checks(method, base_request)
+            self.found_params[method].update(
+                {
+                    x: {"reason": "heuristics", "reflects": True}
+                    for x in self.start_heuristics_checks(method, base_request)
+                }
             )
 
             comparer = Comparer(self.base_request)
@@ -842,7 +845,9 @@ class Miner:
                             )[1]
                             logger.warning(f"Differences: Reflects;{p}")
                             del origin_pack[p]
-                            self.found_params[method].add(p)
+                            self.found_params[method].update(
+                                {p: {"reason": "reflects", "reflects": True}}
+                            )
                         statuses, status_reason = comparer._compare_statuses(
                             current_request
                         )
@@ -856,9 +861,23 @@ class Miner:
                                 logger.warning(
                                     f"Differences:{f' Statuses:{status_reason}' if not statuses else ''}{f' Texts:{text_reason}' if not texts else ''}{f' Times:{time_reason}' if not times else ''}"
                                 )
+                            reason = list()
+                            if not statuses:
+                                reason += ["status"]
+                            if not texts:
+                                reason += ["texts"]
+                            if not times:
+                                reason += ["times"]
+
                             if len(origin_pack) == 1:
-                                self.found_params[method].add(
-                                    list(origin_pack.keys())[0]
+                                self.found_params[method].update(
+                                    {
+                                        x: {
+                                            "reflects": False,
+                                            "reason": ", ".join(reason),
+                                        }
+                                        for x in list(origin_pack.keys())
+                                    }
                                 )
                                 break
                             # splitting the pack
@@ -914,7 +933,7 @@ class Miner:
         paramFormat = ParamFormat(self.parameter_template)
         self.found_params = {}
         for method in self.methods:
-            self.found_params[method] = set()
+            self.found_params[method] = dict()
             base_request, number_reflexions = await self.find_baseinfo_async(
                 method, paramFormat
             )
@@ -923,8 +942,11 @@ class Miner:
             max_length = await self.find_max_length_async(method, paramFormat)
             logger.debug(f"Found URL/DATA max length of {max_length}")
             logger.debug("Starting heuristics checks")
-            self.found_params[method].union(
-                self.start_heuristics_checks(method, base_request)
+            self.found_params[method].update(
+                {
+                    x: {"reason": "heuristics", "reflects": True}
+                    for x in self.start_heuristics_checks(method, base_request)
+                }
             )
 
             comparer = Comparer(self.base_request)
@@ -966,7 +988,9 @@ class Miner:
                         ]
                         logger.warning(f"Differences: Reflects;{p}")
                         del origin_pack[p]
-                        self.found_params[method].add(p)
+                        self.found_params[method].update(
+                                {p: {"reason": "reflects", "reflects": True}}
+                            )
                     if len(origin_pack) <= 1:
                         return None, None
                     statuses, status_reason = comparer._compare_statuses(
@@ -983,8 +1007,24 @@ class Miner:
                                 f"Differences:{f' Statuses:{status_reason}' if not statuses else ''}{f' Texts:{text_reason}' if not texts else ''}{f' Times:{time_reason}' if not times else ''}"
                             )
 
+                        reason = list()
+                        if not statuses:
+                            reason += ["status"]
+                        if not texts:
+                            reason += ["texts"]
+                        if not times:
+                            reason += ["times"]
+
                         if len(origin_pack) == 1:
-                            self.found_params[method].add(list(origin_pack.keys())[0])
+                            self.found_params[method].update(
+                                {
+                                    x: {
+                                        "reflects": False,
+                                        "reason": ", ".join(reason),
+                                    }
+                                    for x in list(origin_pack.keys())
+                                }
+                            )
                             return None, None
                         # splitting the pack
                         first_half_pack = dict(
@@ -1034,7 +1074,6 @@ class Miner:
                         t1, t2 = process_response(res)
                         if t1 and t2:
                             formatted_packs += [t1, t2]
-
 
             logger.success("Fuzzing completed !")
             print(f"{self.found_params}")
